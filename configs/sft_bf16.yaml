@@ -1,0 +1,119 @@
+# ============================================================
+# ReaSeg SFT bf16 config
+#
+# This YAML is an experiment record / human-readable config.
+# Current train/train_sft.py mainly uses CLI arguments.
+# scripts/run_sft.sh can be kept in sync with this file.
+# ============================================================
+
+project:
+  name: ReaSeg
+  task: medical_reasoning_segmentation
+  description: >
+    Qwen2.5-VL + [SEG] token + ReaSegProjector + MedSAM image encoder
+    + MedSAM mask decoder for medical image reasoning segmentation.
+
+paths:
+  model_name_or_path: ./checkpoints/Qwen/Qwen2.5-VL-3B-Instruct
+  medsam_checkpoint: ./checkpoints/medsam_vit_b.pth
+
+  # DATA_PATH can be:
+  #   1. a directory containing train.json and optionally val.json
+  #   2. a single JSON file
+  data_path: ./dataset
+
+  output_dir: ./outputs/reaseg_sft_bf16
+
+model:
+  seg_token: "[SEG]"
+  image_size: 1024
+  prompt_dim: 256
+  max_seq_length: 2048
+
+  # If true, mask loss only updates SEG projector / mask branch,
+  # not Qwen LoRA hidden states.
+  detach_seg_hidden_for_mask: true
+
+loss:
+  ce_loss_weight: 1.0
+  dice_loss_weight: 0.5
+  bce_loss_weight: 2.0
+
+projector:
+  train_seg_projector: true
+  projector_init_std: 0.001
+  projector_output_scale: 1.0
+  projector_clamp_value: 10.0
+
+medsam:
+  # Recommended first-stage setting:
+  #   none
+  #
+  # After stable frozen-forward training:
+  #   partial
+  #
+  # Supported by current code:
+  #   none
+  #   partial
+  #   head_plus_upscaling
+  #   full
+  mask_decoder_train_mode: none
+
+qwen:
+  train_qwen_visual_projector: false
+
+lora:
+  use_lora: true
+
+  # Supported:
+  #   llm
+  #   qwen_visual
+  #   llm_qwen_visual
+  #   custom
+  lora_scope: llm
+
+  # Only used when lora_scope = custom.
+  lora_target_modules: null
+
+  lora_r: 8
+  lora_alpha: 8
+  lora_dropout: 0.05
+
+optimization:
+  learning_rate: 1.0e-5
+  seg_projector_lr: 1.0e-5
+
+  # Keep very small when enabling partial mask decoder.
+  mask_decoder_lr: 1.0e-8
+
+  weight_decay: 0.0
+  adam_eps: 1.0e-6
+  max_grad_norm: 0.3
+  warmup_steps: 0
+
+training:
+  precision: bf16
+  zero_stage: 2
+
+  epochs: 10
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  workers: 4
+  seed: 42
+
+logging:
+  log_interval: 10
+
+  # 0 means disabled.
+  eval_interval: 0
+  save_interval: 0
+  max_val_batches: 20
+
+debug:
+  debug_vl_alignment: true
+  debug_numerics: true
+  debug_steps: 5
+  skip_nonfinite_loss: false
+
+deepspeed:
+  config_file: ./configs/deepspeed_zero2.json
