@@ -6,7 +6,6 @@ import argparse
 import numpy as np
 from datetime import datetime
 from tqdm import tqdm
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -15,34 +14,27 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import torch.nn.functional as F
-
 import monai
 from segment_anything import sam_model_registry
 from segment_anything.utils.transforms import ResizeLongestSide
 
-# ==========================================
-# 1. 智能数据集定义 (支持单/多数据集自动发现与在线预处理)
-# ==========================================
 class MedSAMOnlineDataset(Dataset):
     def __init__(self, data_dir, split="train", img_size=1024, bbox_shift=5):
         """
-        data_dir: 基础数据路径
-        split: "train" 或 "val"
+        data_dir: data_name
+        split: "train" or "val"
         """
-        self.data_dir = data_dir
+        self.data_dir = dataset_dir
         self.split = split
         self.img_size = img_size
         self.bbox_shift = bbox_shift
         self.sam_transform = ResizeLongestSide(img_size)
         self.image_paths = []
 
-        # 智能路径解析逻辑
-        # 1. 判断是否为单数据集 (即 data_dir 下直接存在 train/val 文件夹)
         if os.path.exists(os.path.join(data_dir, split, 'images')):
             img_dir = os.path.join(data_dir, split, 'images')
             self.image_paths.extend(glob.glob(os.path.join(img_dir, '*.*')))
-            dataset_type = "单数据集"
-        # 2. 判断是否为多数据集集合 (即 data_dir 下包含 Skin, BraTS 等子文件夹)
+            dataset_type = "single dataset"
         else:
             for subdir in os.listdir(data_dir):
                 dataset_path = os.path.join(data_dir, subdir)
@@ -50,11 +42,10 @@ class MedSAMOnlineDataset(Dataset):
                     img_dir = os.path.join(dataset_path, split, 'images')
                     if os.path.exists(img_dir):
                         self.image_paths.extend(glob.glob(os.path.join(img_dir, '*.*')))
-            dataset_type = "多数据集"
+            dataset_type = "multi datasets"
 
-        # 过滤有效的图片后缀
         self.image_paths = [p for p in self.image_paths if p.lower().endswith(('.png', '.jpg', '.jpeg'))]
-        print(f"[Dataset - {split.upper()}] 模式: {dataset_type} | 共找到 {len(self.image_paths)} 张图像。")
+        print(f"[Dataset - {split.upper()}] mode: {dataset_type} | A total of {len(self.image_paths)} images have been found.")
 
     def __len__(self):
         return len(self.image_paths)
@@ -75,7 +66,6 @@ class MedSAMOnlineDataset(Dataset):
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
         
-        # 动态推导 mask 路径 (将路径中的 '/images' 替换为 '/masks')
         parent_dir = os.path.dirname(img_path)
         mask_dir = parent_dir.replace(f'{os.sep}images', f'{os.sep}masks')
         
@@ -86,32 +76,26 @@ class MedSAMOnlineDataset(Dataset):
         if not os.path.exists(mask_path):
             mask_path = os.path.join(mask_dir, img_name)
             
-        # 读取图像和标签
         image = cv2.imread(img_path)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         mask_gt = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         original_size = image.shape[:2]
         
-        # 提取 BBox 并缩放
         bbox_original = self.get_bbox_from_mask(mask_gt)
         box_scaled = self.sam_transform.apply_boxes(bbox_original, original_size)
         
-        # 图像缩放与转Tensor
         input_image = self.sam_transform.apply_image(image)
         input_image_torch = torch.as_tensor(input_image).permute(2, 0, 1).contiguous()
         
-        # Mask 缩放与转Tensor (最近邻插值)
         input_mask = self.sam_transform.apply_image(mask_gt)
         input_mask_torch = torch.as_tensor(input_mask).contiguous()
 
-        # 统一填充到 1024x1024
         h, w = input_image_torch.shape[-2:]
         padh = self.img_size - h
         padw = self.img_size - w
         image_padded = F.pad(input_image_torch, (0, padw, 0, padh))
         mask_padded = F.pad(input_mask_torch, (0, padw, 0, padh))
         
-        # Mask 归一化为 0 和 1
         mask_padded = (mask_padded > 0).float().unsqueeze(0) 
 
         return {
@@ -120,9 +104,6 @@ class MedSAMOnlineDataset(Dataset):
             "mask": mask_padded
         }
 
-# ==========================================
-# 2. 参数统计与打印输出
-# ==========================================
 def print_parameter_statistics(model, local_rank):
     if local_rank != 0:
         return
@@ -139,37 +120,30 @@ def print_parameter_statistics(model, local_rank):
     total_msk, train_msk, ratio_msk = get_stats(model.mask_decoder)
 
     print("\n" + "="*85)
-    print(f"{'组件 (Component)':<25} | {'参数总量 (Total)':<18} | {'训练参数量 (Trainable)':<18} | {'训练占比 (%)':<10}")
+    print(f"{'Component (Component)':<25} | {'Total':<18} | {'Trainable':<18} | {' proportion (%)':<10}")
     print("-" * 85)
-    print(f"{'MedSAM (整体模型)':<25} | {total_all:<18,} | {train_all:<18,} | {ratio_all:.2f}%")
+    print(f"{'MedSAM (full)':<25} | {total_all:<18,} | {train_all:<18,} | {ratio_all:.2f}%")
     print(f"{'  ├─ Image Encoder':<24} | {total_img:<18,} | {train_img:<18,} | {ratio_img:.2f}%")
     print(f"{'  ├─ Prompt Encoder':<24} | {total_prm:<18,} | {train_prm:<18,} | {ratio_prm:.2f}%")
     print(f"{'  └─ Mask Decoder':<24} | {total_msk:<18,} | {train_msk:<18,} | {ratio_msk:.2f}%")
     print("="*85 + "\n")
 
-
-# ==========================================
-# 3. 训练与验证主循环
-# ==========================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', type=str, required=True, help='数据集根路径 (单数据集或多数据集均可)')
-    parser.add_argument('--save_dir', type=str, default='./work_dir/MedSAM_Finetuned', help='模型保存路径')
-    parser.add_argument('--checkpoint', type=str, default='./work_dir/MedSAM/medsam_vit_b.pth', help='预训练权重')
+    parser.add_argument('--data_dir', type=str, required=True, help='Dataset root path (for a single dataset or multiple datasets)')
+    parser.add_argument('--save_dir', type=str, default='./work_dir/MedSAM_Finetuned', help='Model saving path')
+    parser.add_argument('--checkpoint', type=str, default='./work_dir/MedSAM/medsam_vit_b.pth', help='Pretrained weights')
     
-    # 超参数
     parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=0.01)
-    
-    # 冻结控制参数
-    parser.add_argument('--freeze_image_encoder', action='store_true', help='是否冻结 Image Encoder (推荐开启)')
-    parser.add_argument('--freeze_prompt_encoder', action='store_true', help='是否冻结 Prompt Encoder')
-    parser.add_argument('--freeze_mask_decoder', action='store_true', help='是否冻结 Mask Decoder')
+
+    parser.add_argument('--freeze_image_encoder', action='store_true', help='Should the Image Encoder be frozen (recommended to enable)?')
+    parser.add_argument('--freeze_prompt_encoder', action='store_true', help='Should the Prompt Encoder be frozen?')
+    parser.add_argument('--freeze_mask_decoder', action='store_true', help='Should the Mask Decoder be frozen?')
     args = parser.parse_args()
 
-    # DDP 分布式环境初始化
     is_distributed = "WORLD_SIZE" in os.environ
     if is_distributed:
         dist.init_process_group(backend="nccl")
@@ -182,9 +156,8 @@ def main():
 
     if local_rank == 0:
         os.makedirs(args.save_dir, exist_ok=True)
-        print(f"✅ 启动任务: 分布式={is_distributed}, GPU数量={os.environ.get('WORLD_SIZE', 1)}")
+        print(f"✅ Start the task: Distributed={is_distributed}, GPU_num={os.environ.get('WORLD_SIZE', 1)}")
 
-    # 加载模型
     model = sam_model_registry["vit_b"](checkpoint=args.checkpoint)
     
     if args.freeze_image_encoder:
@@ -202,7 +175,6 @@ def main():
     
     sam_model = model.module if is_distributed else model
 
-    # ================= 数据加载 (训练集与验证集) =================
     train_dataset = MedSAMOnlineDataset(args.data_dir, split="train")
     val_dataset = MedSAMOnlineDataset(args.data_dir, split="val")
     
@@ -212,20 +184,17 @@ def main():
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=train_sampler, shuffle=(train_sampler is None), num_workers=4, pin_memory=True)
     val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler, shuffle=False, num_workers=4, pin_memory=True)
 
-    # 优化器与损失函数
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     if len(trainable_params) == 0:
-        raise ValueError("所有组件都被冻结了！没有可训练的参数！")
+        raise ValueError("All components have been frozen! There are no trainable parameters!")
         
     optimizer = optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     seg_loss_fn = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
 
-    # ================= 主循环 =================
     best_val_loss = float('inf')
     for epoch in range(args.epochs):
         if is_distributed: train_sampler.set_epoch(epoch)
         
-        # ----------------- 训练阶段 -----------------
         model.train()
         train_loss = 0.0
         pbar_train = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]", disable=(local_rank != 0))
@@ -263,7 +232,6 @@ def main():
             if local_rank == 0:
                 pbar_train.set_postfix({"Loss": f"{loss.item():.4f}"})
 
-        # ----------------- 验证阶段 -----------------
         model.eval()
         val_loss = 0.0
         pbar_val = tqdm(val_dataloader, desc=f"Epoch {epoch+1}/{args.epochs} [Val]", disable=(local_rank != 0))
@@ -293,25 +261,21 @@ def main():
                 if local_rank == 0:
                     pbar_val.set_postfix({"Loss": f"{loss.item():.4f}"})
 
-        # --- 跨多卡汇总验证Loss (确保精确度) ---
         avg_val_loss = val_loss / len(val_dataloader)
         if is_distributed:
             loss_tensor = torch.tensor([avg_val_loss], device=device)
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
             avg_val_loss = loss_tensor.item() / int(os.environ["WORLD_SIZE"])
 
-        # ================= Epoch 结束，模型保存 =================
         if local_rank == 0:
             avg_train_loss = train_loss / len(train_dataloader)
-            print(f"🎯 Epoch {epoch+1} 结束 | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+            print(f"🎯 Epoch {epoch+1} finish | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
             
-            # 保存 Latest
             torch.save(sam_model.state_dict(), os.path.join(args.save_dir, "medsam_latest.pth"))
-            # 根据 Val Loss 保存 Best Model
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
                 torch.save(sam_model.state_dict(), os.path.join(args.save_dir, "medsam_best.pth"))
-                print(f"🌟 发现最佳模型 (Val Loss: {best_val_loss:.4f})，已保存！")
+                print(f"🌟 Discover the best model (Val Loss: {best_val_loss:.4f})，Saved!")
 
     if is_distributed:
         dist.destroy_process_group()
